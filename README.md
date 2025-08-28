@@ -84,21 +84,41 @@ terraform apply
 ### 3. Build and Deploy Application
 
 ```bash
-# Build Lambda package
-cd lambda/process_document
-pip install -r requirements.txt -t .
-zip -r ../../process_document.zip .
-
-# Update Lambda function
-aws lambda update-function-code \
-  --function-name process-document \
-  --zip-file fileb://process_document.zip
+# Get ECR repository URL from Terraform
+cd terraform
+terraform refresh
+ECR_REPO=$(terraform output -raw ecr_repository_url)
 
 # Build and push API container
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-east-1.amazonaws.com
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $ECR_REPO
 docker build -t knowledge-base-api ./app
-docker tag knowledge-base-api:latest <account>.dkr.ecr.us-east-1.amazonaws.com/knowledge-base-api:latest
-docker push <account>.dkr.ecr.us-east-1.amazonaws.com/knowledge-base-api:latest
+docker tag knowledge-base-api:latest $ECR_REPO:latest
+docker push $ECR_REPO:latest
+
+# Update ECS service to use the new image
+aws ecs update-service \
+  --cluster knowledge-base-cluster \
+  --service knowledge-base-api \
+  --force-new-deployment \
+  --region us-east-1
+```
+
+### 4. Verify Deployment
+
+```bash
+# Check ECS service status
+aws ecs describe-services --cluster knowledge-base-cluster --services knowledge-base-api
+
+# Check running tasks
+aws ecs list-tasks --cluster knowledge-base-cluster --service-name knowledge-base-api
+
+# Test the API endpoints
+ALB_URL=$(terraform output -raw api_endpoint)
+curl -X GET "${ALB_URL}/health"
+curl -X GET "${ALB_URL}/"
+
+# Check S3 bucket name for document uploads
+S3_BUCKET=$(terraform output -raw s3_bucket_name)
 ```
 
 ## 📖 Usage
@@ -154,12 +174,16 @@ curl -X POST "http://your-alb-endpoint/query" \
 
 ### AWS Bedrock Models
 
-The system uses these Bedrock models by default:
+The system automatically tries multiple embedding models in order:
 
-- **Embeddings**: `amazon.titan-embed-text-v1`
+- **Primary**: `amazon.titan-embed-text-v1`
+- **Fallback**: `amazon.titan-embed-text-v2:0`
+- **Alternative**: `cohere.embed-english-v3`
 - **Text Generation**: `anthropic.claude-3-sonnet-20240229-v1:0`
 
-To change models, update the `modelId` in:
+**Model Access**: Ensure you have enabled model access in the AWS Bedrock console for at least one of the embedding models listed above.
+
+To change models, update the `models_to_try` array in:
 - `lambda/process_document/index.py`
 - `app/main.py`
 
@@ -171,6 +195,20 @@ To change models, update the `modelId` in:
 | `BEDROCK_REGION` | AWS region for Bedrock | `us-east-1` |
 | `DOCUMENTS_BUCKET` | S3 bucket for documents | Set by Terraform |
 | `AWS_REGION` | AWS region | `us-east-1` |
+
+### ⚠️ Known Issues
+
+**Lambda OpenSearch Integration**: Currently, the Lambda function generates embeddings successfully but cannot store them in OpenSearch due to a dependency issue with `opensearch-py`. 
+
+**Current Status:**
+- ✅ API endpoints working (`/health`, `/query`)
+- ✅ Document upload to S3 triggers Lambda
+- ✅ Embedding generation with Bedrock Titan
+- ❌ Document storage in OpenSearch (dependency issue)
+
+**Workaround**: The API returns "no documents found" until the Lambda dependency is resolved.
+
+**Fix**: Update Lambda deployment to properly include opensearch-py dependency.
 
 ### Scaling Configuration
 
@@ -235,11 +273,30 @@ python tests/load/load_test.py
 # Deploy infrastructure changes
 cd terraform && terraform apply
 
-# Update Lambda function
-./scripts/deploy-lambda.sh
+# Build and deploy the API container
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+ECR_REPOSITORY=$(aws ecr describe-repositories --repository-names knowledge-base-api --query 'repositories[0].repositoryUri' --output text)
 
-# Update ECS service
-./scripts/deploy-api.sh
+# Build and push container
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com
+docker build -t knowledge-base-api ./app
+docker tag knowledge-base-api:latest ${ECR_REPOSITORY}:latest  
+docker push ${ECR_REPOSITORY}:latest
+
+# Force ECS service deployment
+aws ecs update-service \
+  --cluster knowledge-base-cluster \
+  --service knowledge-base-api \
+  --force-new-deployment
+
+# Update Lambda function (if changed)
+cd lambda/process_document
+pip install -r requirements.txt -t .
+zip -r ../../terraform/process_document.zip . -x "__pycache__/*" "*.pyc"
+cd ../../terraform
+aws lambda update-function-code \
+  --function-name knowledge-base-process-document \
+  --zip-file fileb://process_document.zip
 ```
 
 ## 📊 Monitoring
@@ -330,6 +387,28 @@ pre-commit install
 3. Go to "Model access" in the left sidebar
 4. Request access to required models (Titan, Claude)
 5. Wait for approval (usually instant for standard models)
+
+### Why am I getting "no documents found" responses?
+
+This indicates the Lambda function processed documents but couldn't store them in OpenSearch. Check:
+
+1. **Lambda logs**: `aws logs filter-log-events --log-group-name "/aws/lambda/knowledge-base-process-document" --region us-east-1`
+2. **Bedrock access**: Ensure embedding models are enabled
+3. **OpenSearch dependency**: The Lambda currently has an `opensearch-py` import issue
+
+### How do I fix the Lambda dependency issue?
+
+The Lambda deployment may not include all required packages. To fix:
+
+```bash
+cd terraform
+# Force Lambda redeployment
+terraform apply -target=aws_lambda_function.process_document -auto-approve
+
+# Monitor logs after uploading a test document
+aws s3 cp test.pdf s3://your-bucket-name/
+aws logs tail /aws/lambda/knowledge-base-process-document --follow
+```
 
 ### Can I use different vector databases?
 

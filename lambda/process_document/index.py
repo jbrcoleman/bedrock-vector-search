@@ -53,12 +53,10 @@ def handler(event, context):
                         # Generate embeddings using Bedrock
                         embedding = generate_embedding(bedrock_client, chunk)
                         
-                        # Store in OpenSearch (simplified for now - just log)
+                        # Store in OpenSearch
+                        store_in_opensearch(chunk, embedding, key, i)
                         logger.info(f"Generated embedding for chunk {i} of {key} (embedding size: {len(embedding)})")
                         processed_chunks += 1
-                        
-                        # In a real implementation, you would store this in OpenSearch here
-                        # store_in_opensearch(chunk, embedding, key, i)
                         
                     except Exception as e:
                         logger.error(f"Error processing chunk {i} of {key}: {str(e)}")
@@ -147,13 +145,30 @@ def generate_embedding(bedrock_client, text):
             "inputText": text
         })
         
-        # Call Bedrock
-        response = bedrock_client.invoke_model(
-            modelId='amazon.titan-embed-text-v1',
-            body=body,
-            contentType='application/json',
-            accept='application/json'
-        )
+        # Call Bedrock - try multiple models in order of preference
+        models_to_try = [
+            'amazon.titan-embed-text-v1',
+            'amazon.titan-embed-text-v2:0',
+            'cohere.embed-english-v3'
+        ]
+        
+        last_error = None
+        for model_id in models_to_try:
+            try:
+                response = bedrock_client.invoke_model(
+                    modelId=model_id,
+                    body=body,
+                    contentType='application/json',
+                    accept='application/json'
+                )
+                logger.info(f"Successfully used model: {model_id}")
+                break
+            except Exception as e:
+                logger.warning(f"Model {model_id} failed: {str(e)}")
+                last_error = e
+                continue
+        else:
+            raise last_error or ValueError("No embedding models available")
         
         # Parse response
         response_body = json.loads(response['body'].read())
@@ -171,8 +186,65 @@ def generate_embedding(bedrock_client, text):
 def store_in_opensearch(content, embedding, source_file, chunk_index):
     """
     Store document chunk and embedding in OpenSearch
-    This is a placeholder - you would implement the actual OpenSearch client here
     """
-    # This function would use opensearch-py to store the data
-    # For now, it's just a placeholder
-    pass
+    try:
+        from opensearchpy import OpenSearch, RequestsHttpConnection
+        
+        # Get OpenSearch endpoint from environment
+        opensearch_endpoint = os.environ['OPENSEARCH_ENDPOINT']
+        
+        # Remove protocol prefix if present
+        clean_endpoint = opensearch_endpoint.replace('https://', '').replace('http://', '')
+        
+        client = OpenSearch(
+            hosts=[{'host': clean_endpoint, 'port': 443}],
+            http_auth=None,
+            use_ssl=True,
+            verify_certs=True,
+            connection_class=RequestsHttpConnection,
+            timeout=30
+        )
+        
+        # Create index if it doesn't exist
+        index_name = "documents"
+        if not client.indices.exists(index=index_name):
+            # Create index with vector mapping
+            mapping = {
+                "mappings": {
+                    "properties": {
+                        "content": {"type": "text"},
+                        "file_name": {"type": "keyword"},
+                        "chunk_id": {"type": "integer"},
+                        "embedding": {
+                            "type": "knn_vector",
+                            "dimension": 1536,
+                            "method": {
+                                "name": "hnsw",
+                                "space_type": "cosinesimilarity"
+                            }
+                        }
+                    }
+                }
+            }
+            client.indices.create(index=index_name, body=mapping)
+            logger.info(f"Created OpenSearch index: {index_name}")
+        
+        # Store document
+        doc = {
+            "content": content,
+            "file_name": source_file,
+            "chunk_id": chunk_index,
+            "embedding": embedding
+        }
+        
+        response = client.index(
+            index=index_name,
+            body=doc,
+            id=f"{source_file}_{chunk_index}"
+        )
+        
+        logger.info(f"Stored document chunk in OpenSearch: {response['_id']}")
+        
+    except Exception as e:
+        logger.error(f"Error storing in OpenSearch: {str(e)}")
+        raise

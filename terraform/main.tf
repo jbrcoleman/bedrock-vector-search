@@ -151,6 +151,13 @@ resource "aws_security_group" "opensearch" {
     cidr_blocks = [var.vpc_cidr]
   }
   
+  ingress {
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.lambda.id, aws_security_group.ecs.id]
+  }
+  
   egress {
     from_port   = 0
     to_port     = 0
@@ -160,6 +167,23 @@ resource "aws_security_group" "opensearch" {
   
   tags = merge(var.tags, {
     Name = "${var.project_name}-opensearch-sg"
+  })
+}
+
+# Security Group for Lambda
+resource "aws_security_group" "lambda" {
+  name_prefix = "${var.project_name}-lambda-"
+  vpc_id      = aws_vpc.main.id
+  
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-lambda-sg"
   })
 }
 
@@ -300,6 +324,11 @@ resource "aws_lambda_function" "process_document" {
     }
   }
   
+  vpc_config {
+    subnet_ids         = aws_subnet.public[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
+  
   depends_on = [
     aws_iam_role_policy_attachment.lambda_logs,
     aws_cloudwatch_log_group.lambda_logs,
@@ -380,6 +409,11 @@ resource "aws_iam_role_policy" "lambda_policy" {
 resource "aws_iam_role_policy_attachment" "lambda_logs" {
   role       = aws_iam_role.lambda_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_vpc" {
+  role       = aws_iam_role.lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
 # IAM Role for ECS Task
@@ -487,3 +521,86 @@ resource "aws_lb_listener" "api" {
     target_group_arn = aws_lb_target_group.api.arn
   }
 }
+
+# ECS Task Definition
+resource "aws_ecs_task_definition" "api" {
+  family                   = "${var.project_name}-api"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                     = var.ecs_cpu
+  memory                  = var.ecs_memory
+  execution_role_arn      = aws_iam_role.ecs_execution_role.arn
+  task_role_arn           = aws_iam_role.ecs_task_role.arn
+
+  container_definitions = jsonencode([
+    {
+      name  = "api"
+      image = "${aws_ecr_repository.api.repository_url}:latest"
+      
+      portMappings = [
+        {
+          containerPort = 8000
+          protocol      = "tcp"
+        }
+      ]
+      
+      environment = [
+        {
+          name  = "AWS_REGION"
+          value = var.aws_region
+        },
+        {
+          name  = "OPENSEARCH_ENDPOINT"
+          value = aws_opensearch_domain.vector_db.endpoint
+        }
+      ]
+      
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.api_logs.name
+          awslogs-region        = var.aws_region
+          awslogs-stream-prefix = "ecs"
+        }
+      }
+      
+      essential = true
+    }
+  ])
+
+  tags = var.tags
+}
+
+# ECS Service
+resource "aws_ecs_service" "api" {
+  name            = "${var.project_name}-api"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.api.arn
+  desired_count   = var.ecs_desired_count
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = aws_subnet.public[*].id
+    security_groups  = [aws_security_group.ecs.id]
+    assign_public_ip = true
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.api.arn
+    container_name   = "api"
+    container_port   = 8000
+  }
+
+  depends_on = [aws_lb_listener.api]
+
+  tags = var.tags
+}
+
+# CloudWatch Log Group for API
+resource "aws_cloudwatch_log_group" "api_logs" {
+  name              = "/ecs/${var.project_name}-api"
+  retention_in_days = 14
+  
+  tags = var.tags
+}
+
