@@ -44,3 +44,6 @@ terraform.rc
 
 # Ignore OS generated files
 Thumbs.db
+
+# lambda layer files
+terraform/lambda_layers/*
