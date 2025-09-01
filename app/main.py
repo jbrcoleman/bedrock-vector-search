@@ -4,6 +4,7 @@ import os
 import boto3
 import json
 from opensearchpy import OpenSearch, RequestsHttpConnection
+from requests_aws4auth import AWS4Auth
 from typing import List, Optional
 
 app = FastAPI(title="Knowledge Base API", version="1.0.0")
@@ -32,9 +33,23 @@ def get_opensearch_client():
     # Remove protocol prefix if present
     clean_endpoint = opensearch_endpoint.replace('https://', '').replace('http://', '')
     
+    # Get AWS credentials and region
+    session = boto3.Session()
+    credentials = session.get_credentials()
+    region = session.region_name or os.environ.get("AWS_REGION", "us-east-1")
+    
+    # Create AWS4Auth for signing requests
+    auth = AWS4Auth(
+        credentials.access_key,
+        credentials.secret_key,
+        region,
+        'es',  # service name for OpenSearch
+        session_token=credentials.token
+    )
+    
     return OpenSearch(
         hosts=[{'host': clean_endpoint, 'port': 443}],
-        http_auth=None,  # Use IAM auth instead of basic auth
+        http_auth=auth,  # Use AWS IAM auth
         use_ssl=True,
         verify_certs=True,
         connection_class=RequestsHttpConnection,
@@ -105,9 +120,16 @@ def search_similar_documents(query_embedding: List[float], top_k: int = 5) -> Li
         return []
 
 def generate_answer(question: str, context: str) -> str:
-    """Generate answer using AWS Bedrock Claude"""
-    try:
-        prompt = f"""Based on the following context, answer the question. If the context doesn't contain enough information, say so.
+    """Generate answer using AWS Bedrock Claude or fallback to context summary"""
+    
+    # List of models to try in order of preference  
+    models_to_try = [
+        'anthropic.claude-3-haiku-20240307-v1:0',  # Most accessible
+        'anthropic.claude-instant-v1',  # Legacy but often available
+        'anthropic.claude-3-sonnet-20240229-v1:0'  # Original choice
+    ]
+    
+    prompt = f"""Based on the following context, answer the question. If the context doesn't contain enough information, say so.
 
 Context: {context}
 
@@ -115,24 +137,39 @@ Question: {question}
 
 Answer:"""
 
-        response = bedrock_client.invoke_model(
-            modelId="anthropic.claude-3-sonnet-20240229-v1:0",
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 1000,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ]
-            })
-        )
-        
-        response_body = json.loads(response['body'].read())
-        return response_body['content'][0]['text']
-    except Exception as e:
-        return f"Error generating answer: {str(e)}"
+    # Try each model
+    for model_id in models_to_try:
+        try:
+            response = bedrock_client.invoke_model(
+                modelId=model_id,
+                body=json.dumps({
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 1000,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ]
+                })
+            )
+            
+            response_body = json.loads(response['body'].read())
+            return response_body['content'][0]['text']
+        except Exception as e:
+            print(f"Model {model_id} failed: {str(e)}")
+            continue
+    
+    # Fallback: provide context summary when no models are available
+    print("No Bedrock models available, providing context-based response")
+    if context.strip():
+        return f"""Based on the retrieved documents, here's what I found relevant to your question:
+
+{context}
+
+Note: I was able to find relevant information from your document collection, but couldn't process it through an AI model to provide a more refined answer. The above content contains the most relevant information from your documents related to your query."""
+    else:
+        return "I couldn't find any relevant documents to answer your question."
 
 @app.get("/")
 async def root():

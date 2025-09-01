@@ -104,10 +104,11 @@ resource "aws_opensearch_domain" "vector_db" {
     volume_size = var.opensearch_ebs_volume_size
   }
   
-  vpc_options {
-    subnet_ids         = [aws_subnet.public[0].id]
-    security_group_ids = [aws_security_group.opensearch.id]
-  }
+# VPC options removed to make OpenSearch publicly accessible for Lambda access
+  # vpc_options {
+  #   subnet_ids         = [aws_subnet.public[0].id]
+  #   security_group_ids = [aws_security_group.opensearch.id]
+  # }
   
   domain_endpoint_options {
     enforce_https       = true
@@ -126,8 +127,20 @@ resource "aws_opensearch_domain" "vector_db" {
     Version = "2012-10-17"
     Statement = [
       {
-        Action = "es:*"
-        Principal = "*"
+        Action = [
+          "es:ESHttpPost",
+          "es:ESHttpPut", 
+          "es:ESHttpGet",
+          "es:ESHttpDelete",
+          "es:ESHttpHead"
+        ]
+        Principal = {
+          AWS = [
+            aws_iam_role.lambda_role.arn,
+            aws_iam_role.ecs_task_role.arn,
+            "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+          ]
+        }
         Effect = "Allow"
         Resource = "arn:aws:es:${var.aws_region}:${data.aws_caller_identity.current.account_id}:domain/${var.project_name}-vectors/*"
       }
@@ -156,6 +169,14 @@ resource "aws_security_group" "opensearch" {
     to_port         = 443
     protocol        = "tcp"
     security_groups = [aws_security_group.lambda.id, aws_security_group.ecs.id]
+  }
+  
+  # Allow Lambda access from outside VPC (since Lambda is no longer in VPC)
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
   
   egress {
@@ -297,6 +318,24 @@ resource "aws_s3_bucket_notification" "document_upload" {
   depends_on = [aws_lambda_permission.allow_s3]
 }
 
+# Lambda layer for OpenSearch dependencies
+data "archive_file" "opensearch_layer_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/lambda_layers/opensearch"
+  output_path = "${path.module}/opensearch_layer.zip"
+  excludes    = ["__pycache__", "*.pyc"]
+}
+
+resource "aws_lambda_layer_version" "opensearch" {
+  filename                 = data.archive_file.opensearch_layer_zip.output_path
+  layer_name               = "${var.project_name}-opensearch-layer"
+  compatible_runtimes      = ["python3.9"]
+  source_code_hash         = data.archive_file.opensearch_layer_zip.output_base64sha256
+  description              = "OpenSearch Python client and AWS authentication libraries"
+  
+  depends_on = [data.archive_file.opensearch_layer_zip]
+}
+
 # Lambda deployment package
 data "archive_file" "lambda_zip" {
   type        = "zip"
@@ -316,6 +355,8 @@ resource "aws_lambda_function" "process_document" {
   memory_size     = var.lambda_memory_size
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
   
+  layers = [aws_lambda_layer_version.opensearch.arn]
+  
   environment {
     variables = {
       OPENSEARCH_ENDPOINT = aws_opensearch_domain.vector_db.endpoint
@@ -324,10 +365,11 @@ resource "aws_lambda_function" "process_document" {
     }
   }
   
-  vpc_config {
-    subnet_ids         = aws_subnet.public[*].id
-    security_group_ids = [aws_security_group.lambda.id]
-  }
+# VPC config removed to fix networking issues - Lambda needs internet access for Bedrock
+  # vpc_config {
+  #   subnet_ids         = aws_subnet.public[*].id
+  #   security_group_ids = [aws_security_group.lambda.id]
+  # }
   
   depends_on = [
     aws_iam_role_policy_attachment.lambda_logs,
